@@ -1,8 +1,13 @@
 <?php
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
 if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
-session_regenerate_id(true);
+if (session_status() === PHP_SESSION_ACTIVE) {
+    session_regenerate_id(true);
+}
 
 require_once 'config.php';
 require_once INCLUDES_DIR . '/database.php';
@@ -114,7 +119,10 @@ switch ($page) {
                 $_SESSION['message'] = array('type' => 'success', 'text' => 'Survey updated!');
                 redirect('index.php?page=edit&id=' . $surveyId);
             } elseif (isset($_POST['add_question'])) {
-                $options = array_filter($_POST['options'] ?? array(), fn($o) => !empty(trim($o)));
+                $options = array();
+                if (isset($_POST['options']) && is_array($_POST['options'])) {
+                    $options = array_filter($_POST['options'], function($o) { return !empty(trim($o)); });
+                }
                 $questionnaire->addQuestion($surveyId, array(
                     'type' => $_POST['type'],
                     'question_text' => $_POST['question_text'],
@@ -150,34 +158,48 @@ switch ($page) {
         
         if (!$survey) die('Survey not found');
         
+        $viewError = null;
+        
+        if ($survey['identity_mode'] === 'access_code' && isset($_POST['access_code'])) {
+            $db = Database::getInstance();
+            $codeData = $db->validateAccessCode($surveyId, $_POST['access_code']);
+            if (!$codeData) {
+                $viewError = 'Invalid or already used access code';
+            }
+        }
+        
         $questions = $questionnaire->getQuestions($surveyId);
         
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-            $db = Database::getInstance();
-            $respondentName = null;
-            $studentNumber = null;
-            $accessCodeId = null;
-            
-            if ($survey['identity_mode'] === 'identified') {
-                $respondentName = $_POST['respondent_name'] ?? '';
-                $studentNumber = $_POST['student_number'] ?? '';
-            } elseif ($survey['identity_mode'] === 'access_code') {
-                $codeData = $db->validateAccessCode($surveyId, $_POST['access_code'] ?? '');
-                if ($codeData) $accessCodeId = $codeData['id'];
-            }
-            
-            $responseId = $responseHandler->createResponse($surveyId, $respondentName, $studentNumber, $accessCodeId);
-            
-            if ($accessCodeId) $db->markAccessCodeUsed($accessCodeId);
-            
-            foreach ($_POST as $key => $value) {
-                if (strpos($key, 'question_') === 0) {
-                    $questionId = (int)str_replace('question_', '', $key);
-                    $responseHandler->saveAnswer($responseId, $questionId, $value);
+            if (isset($viewError)) {
+                // Invalid access code, don't process
+            } else {
+                $db = Database::getInstance();
+                $respondentName = null;
+                $studentNumber = null;
+                $accessCodeId = null;
+                
+                if ($survey['identity_mode'] === 'identified') {
+                    $respondentName = $_POST['respondent_name'] ?? '';
+                    $studentNumber = $_POST['student_number'] ?? '';
+                } elseif ($survey['identity_mode'] === 'access_code') {
+                    $codeData = $db->validateAccessCode($surveyId, $_POST['access_code'] ?? '');
+                    if ($codeData) $accessCodeId = $codeData['id'];
                 }
+                
+                $responseId = $responseHandler->createResponse($surveyId, $respondentName, $studentNumber, $accessCodeId);
+                
+                if ($accessCodeId) $db->markAccessCodeUsed($accessCodeId);
+                
+                foreach ($_POST as $key => $value) {
+                    if (strpos($key, 'question_') === 0) {
+                        $questionId = (int)str_replace('question_', '', $key);
+                        $responseHandler->saveAnswer($responseId, $questionId, $value);
+                    }
+                }
+                
+                $submitted = true;
             }
-            
-            $submitted = true;
         }
         break;
         
@@ -220,7 +242,9 @@ switch ($page) {
     default:
         if (!isLoggedIn()) {
             $page = 'login';
-        } elseif ($page === 'dashboard' || $page === '') {
+            break;
+        }
+        if ($page === 'dashboard' || $page === '') {
             $currentUser = getCurrentUser();
             if ($currentUser && isset($currentUser['id'])) {
                 $userId = $currentUser['id'];
@@ -475,6 +499,15 @@ switch ($page) {
                 </div>
                 
                 <div class="form-group">
+                    <label class="form-label">Identity Mode</label>
+                    <select name="identity_mode" class="form-select">
+                        <option value="anonymous" <?php echo $survey['identity_mode'] === 'anonymous' ? 'selected' : ''; ?>>Anonymous - No identification</option>
+                        <option value="identified" <?php echo $survey['identity_mode'] === 'identified' ? 'selected' : ''; ?>>Identified - Name & student number</option>
+                        <option value="access_code" <?php echo $survey['identity_mode'] === 'access_code' ? 'selected' : ''; ?>>Access Code - One-time codes</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
                     <label class="form-check">
                         <input type="checkbox" name="is_active" value="1" <?php echo $survey['is_active'] ? 'checked' : ''; ?> class="form-check-input">
                         <span>Active</span>
@@ -493,7 +526,9 @@ switch ($page) {
             <?php else: ?>
             <?php foreach ($questions as $index => $q): ?>
             <?php 
-                $qOptions = is_array($q['options']) ? $q['options'] : json_decode($q['options'] ?? '[]', true);
+                $rawOpts = $q['options'] ?? '';
+                $qOptions = is_array($rawOpts) ? $rawOpts : json_decode($rawOpts, true);
+                if (!is_array($qOptions)) $qOptions = array();
             ?>
             <div class="question-item">
                 <div class="flex justify-between items-center">
@@ -582,6 +617,14 @@ switch ($page) {
         <div class="alert alert-success">Thank you for your response!</div>
         <?php endif; ?>
         
+        <?php if (isset($viewError)): ?>
+        <div class="alert alert-error"><?php echo sanitize($viewError); ?></div>
+        <?php endif; ?>
+        
+        <?php if (empty($questions)): ?>
+        <div class="alert alert-warning">This survey has no questions yet. Please contact the survey creator.</div>
+        <?php endif; ?>
+        
         <div class="card" style="max-width: 700px; margin: 0 auto;">
             <h1 class="card-title"><?php echo sanitize($survey['title']); ?></h1>
             <?php if ($survey['description']): ?>
@@ -613,17 +656,22 @@ switch ($page) {
             <?php endif; ?>
             
                 <?php foreach ($questions as $index => $q): ?>
+                <?php 
+                $type = $q['type'];
+                $rawOptions = $q['options'] ?? '';
+                $options = is_array($rawOptions) ? $rawOptions : json_decode($rawOptions, true);
+                if (!is_array($options)) $options = array();
+                if ($type === 'multiple_choice' && empty($options)) {
+                    $options = ['Option A', 'Option B', 'Option C', 'Option D', 'Option E'];
+                }
+                ?>
                 <div class="form-group">
                     <label class="form-label">
                         <?php echo $index + 1; ?>. <?php echo sanitize($q['question_text']); ?>
                         <?php if ($q['required']): ?><span style="color: red;"> *</span><?php endif; ?>
                     </label>
                     
-                    <?php
-                    $type = $q['type'];
-                    $options = is_array($q['options']) ? $q['options'] : json_decode($q['options'] ?? '[]', true);
-                    
-                    if ($type === 'short_text'): ?>
+                    <?php if ($type === 'short_text'): ?>
                     <input type="text" name="question_<?php echo $q['id']; ?>" class="form-input" <?php echo $q['required'] ? 'required' : ''; ?>>
                     
                     <?php elseif ($type === 'long_text'): ?>
@@ -646,7 +694,7 @@ switch ($page) {
                         </label>
                         <?php endfor; ?>
                     </div>
-                    <small class="text-muted">1 = Strongly Disagree, 5 = Strongly Agree</small>
+                    <small class="text-muted">1 = Strongly Disagree, 2 = Disagree, 3 = Neutral, 4 = Agree, 5 = Strongly Agree</small>
                     
                     <?php elseif ($type === 'yes_no'): ?>
                     <label class="form-check">
@@ -812,7 +860,8 @@ switch ($page) {
                 <thead><tr><th>Scale</th><th>Count</th></tr></thead>
                 <tbody>
                     <?php for ($i = 1; $i <= 5; $i++): ?>
-                    <tr><td><?php echo $i; ?> (<?php echo $i==1?'Strongly Disagree':($i==5?'Strongly Agree':'Neutral'); ?>)</td><td><?php echo $lr['counts'][$i] ?? 0; ?></td></tr>
+                    <?php $labels = ['', 'Strongly Disagree', 'Disagree', 'Neutral', 'Agree', 'Strongly Agree']; ?>
+                    <tr><td><?php echo $i . ' - ' . $labels[$i]; ?></td><td><?php echo $lr['counts'][$i] ?? 0; ?></td></tr>
                     <?php endfor; ?>
                 </tbody>
             </table>
@@ -820,7 +869,7 @@ switch ($page) {
             new Chart(document.getElementById('chart_<?php echo $q['id']; ?>'), {
                 type: 'pie',
                 data: {
-                    labels: ['1 - Strongly Disagree', '2 - Disagree', '3 - Neutral', '4 - Agree', '5 - Strongly Agree'],
+                    labels: ['Strongly Disagree', 'Disagree', 'Neutral', 'Agree', 'Strongly Agree'],
                     datasets: [{
                         data: <?php echo json_encode(array_values($lr['counts'])); ?>,
                         backgroundColor: ['#EF4444', '#F97316', '#F59E0B', '#10B981', '#22C55E']
