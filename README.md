@@ -1,32 +1,50 @@
 # QuestSurvey
+Web-Based Questionnaire System
 
-QuestSurvey is a web‑based questionnaire and survey management system built with **PHP** and **MySQL**, designed for academic and professional use. It provides robust survey creation, response collection, and analysis features with a clean, professional UI.
+## Installation
 
----
+1. Copy the entire project folder to your web server root (e.g., `/var/www/html/QuestSurvey` or `C:\xampp\htdocs\QuestSurvey`)
+2. Ensure PHP 7.4+ with PDO SQLite extension is enabled
+3. Access `http://your-server/QuestSurvey/install.php`
+4. Enter the setup key: `SETUP_ADMIN_2026`
+5. Create an admin username and password
+6. Login at `index.php?page=login`
 
-## 🚀 Features
-- **Survey Creation**: Build questionnaires with multiple choice, text, and rating questions.
-- **Anonymous / Identified Modes**: Support for anonymous responses, identified users, or access‑code protected surveys.
-- **Response Analysis**: Automatic aggregation of results with charts and per‑question breakdowns.
-- **CSV Export**: Export responses for external analysis.
-- **Authentication & Sessions**: Secure login and dashboard for administrators.
-- **Error Handling**: Bullet‑proof session flow, with warnings and PHP errors eliminated.
-- **Professional UI**: Unified navigation, responsive design, and clean presentation.
+## User Roles
 
----
+- **Admin**: Full system access, creates creator accounts
+- **Creator**: Creates/manages questionnaires, views results
+- **User**: Participates in surveys (anonymous or identified)
 
-## 📂 Project Structure
-- `index.php` – Main dashboard
-- `install.php` – Installer script
-- `includes/` – Authentication, database, questionnaire, and response handlers
-- `templates/` – Header and footer components
-- `assets/css/` – Stylesheets
-- `data/` – SQLite databases for questionnaires and responses
-- `docs/` – Documentation (`README.md`, `TECHNICAL.md`, `USERGUIDE.md`)
+## Quick Creator Setup
 
----
+Admin can create creator accounts from Admin Panel (`index.php?page=admin`)
 
-## ⚙️ Installation
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/larabihaidara10-svg/QuestSurvey.git
+## Directory Structure
+
+```
+QuestSurvey/
+├── assets/css/style.css     # Styling
+├── config.php               # Configuration
+├── install.php              # Installation page
+├── index.php                # Main application
+├── includes/                # PHP classes
+│   ├── database.php         # SQLite database
+│   ├── auth.php             # Authentication
+│   ├── questionnaire.php    # Survey management
+│   ├── response.php         # Response handling
+│   └── analysis.php         # Result analysis
+└── templates/               # Layout
+    ├── header.php
+    └── footer.php
+```
+
+## Features
+
+- 7 question types (Multiple Choice, Likert Scale, Short/Long Text, Yes/No, Number, Date)
+- 3 identity modes (Anonymous, Identified, Access Code)
+- Access code generation and one-time use
+- Date-based survey availability
+- CSV export of results
+- Auto-installing database
+- No external dependencies

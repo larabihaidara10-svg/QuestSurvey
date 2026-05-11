@@ -2,989 +2,1103 @@
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
 
-if (session_status() === PHP_SESSION_NONE) {
-    session_start();
-}
-if (session_status() === PHP_SESSION_ACTIVE) {
-    session_regenerate_id(true);
-}
-
 require_once 'config.php';
 require_once INCLUDES_DIR . '/database.php';
 
-$page = isset($_GET['page']) ? $_GET['page'] : 'dashboard';
+$page = $_GET['page'] ?? '';
 
-if ($page === 'install' || $page === 'setup') {
-    if (Database::isInstalled()) redirect('index.php');
-    include 'install.php';
-    exit;
-}
-
-if (!Database::isInstalled()) {
-    redirect('index.php?page=install');
-}
+$db = Database::getInstance();
 
 require_once INCLUDES_DIR . '/auth.php';
 require_once INCLUDES_DIR . '/questionnaire.php';
 require_once INCLUDES_DIR . '/response.php';
+require_once INCLUDES_DIR . '/analysis.php';
 
 $auth = new Auth();
-$questionnaire = new Questionnaire();
-$responseHandler = new ResponseHandler();
+$questionnaire = new QuestionnaireModel();
+$response = new ResponseModel();
+$analysis = new AnalysisModel();
+$currentUser = getCurrentUser();
 
-$message = isset($_SESSION['message']) ? $_SESSION['message'] : null;
-unset($_SESSION['message']);
-
-switch ($page) {
-    case 'login':
-        if (isLoggedIn()) redirect('index.php');
-        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-            $result = $auth->login($_POST['username'] ?? '', $_POST['password'] ?? '');
-            if ($result['success']) redirect('index.php');
-            else $error = $result['error'];
-        }
-        break;
-        
-    case 'register':
-        if (isLoggedIn()) redirect('index.php');
-        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-            $result = $auth->register(
-                $_POST['username'] ?? '',
-                $_POST['password'] ?? '',
-                $_POST['email'] ?? '',
-                $_POST['first_name'] ?? '',
-                $_POST['last_name'] ?? '',
-                $_POST['contact'] ?? ''
-            );
-            if ($result['success']) {
-                $auth->login($_POST['username'], $_POST['password']);
-                redirect('index.php');
-            } else {
-                $error = $result['error'];
-            }
-        }
-        break;
-        
-    case 'logout':
-        $auth->logout();
-        redirect('index.php?page=login');
-        break;
-        
-    case 'surveys':
-        if (!isLoggedIn()) redirect('index.php?page=login');
-        $userId = getCurrentUser()['id'];
-        $surveys = $questionnaire->getAll($userId);
-        break;
-        
-    case 'create':
-        if (!isLoggedIn()) redirect('index.php?page=login');
-        if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['title'])) {
-            $userId = getCurrentUser()['id'];
-            $data = array(
-                'title' => $_POST['title'],
-                'description' => $_POST['description'] ?? '',
-                'identity_mode' => $_POST['identity_mode'] ?? 'anonymous',
-                'start_date' => $_POST['start_date'] ?: null,
-                'end_date' => $_POST['end_date'] ?: null,
-                'allow_multiple' => isset($_POST['allow_multiple']) ? 1 : 0,
-                'is_active' => isset($_POST['is_active']) ? 1 : 0,
-                'access_codes_count' => $_POST['access_codes_count'] ?? 0
-            );
-            
-            $surveyId = $questionnaire->create($userId, $data);
-            if ($surveyId) {
-                $_SESSION['message'] = array('type' => 'success', 'text' => 'Survey created!');
-                redirect('index.php?page=edit&id=' . $surveyId);
-            } else {
-                $error = 'Failed to create survey';
-            }
-        }
-        break;
-        
-    case 'edit':
-        if (!isLoggedIn()) redirect('index.php?page=login');
-        $surveyId = $_GET['id'] ?? 0;
-        $survey = $questionnaire->get($surveyId);
-        
-        if (!$survey || $survey['user_id'] != getCurrentUser()['id']) {
-            $_SESSION['message'] = array('type' => 'error', 'text' => 'Survey not found');
-            redirect('index.php?page=surveys');
-        }
-        
-        $questions = $questionnaire->getQuestions($surveyId);
-        
-        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-            if (isset($_POST['update_survey'])) {
-                $questionnaire->update($surveyId, $_POST);
-                $_SESSION['message'] = array('type' => 'success', 'text' => 'Survey updated!');
-                redirect('index.php?page=edit&id=' . $surveyId);
-            } elseif (isset($_POST['add_question'])) {
-                $options = array();
-                if (isset($_POST['options']) && is_array($_POST['options'])) {
-                    $options = array_filter($_POST['options'], function($o) { return !empty(trim($o)); });
-                }
-                $questionnaire->addQuestion($surveyId, array(
-                    'type' => $_POST['type'],
-                    'question_text' => $_POST['question_text'],
-                    'options' => $options,
-                    'required' => isset($_POST['required']) ? 1 : 0
-                ));
-                $_SESSION['message'] = array('type' => 'success', 'text' => 'Question added!');
-                redirect('index.php?page=edit&id=' . $surveyId);
-            } elseif (isset($_POST['delete_question'])) {
-                $questionnaire->deleteQuestion($_POST['question_id']);
-                $_SESSION['message'] = array('type' => 'success', 'text' => 'Question deleted!');
-                redirect('index.php?page=edit&id=' . $surveyId);
-            }
-        }
-        break;
-        
-    case 'delete':
-        if (!isLoggedIn()) redirect('index.php?page=login');
-        $surveyId = $_GET['id'] ?? 0;
-        $survey = $questionnaire->get($surveyId);
-        
-        if ($survey && $survey['user_id'] == getCurrentUser()['id']) {
-            $questionnaire->delete($surveyId);
-            $_SESSION['message'] = array('type' => 'success', 'text' => 'Survey deleted!');
-        }
-        
-        redirect('index.php?page=surveys');
-        break;
-        
-    case 'view':
-        $surveyId = $_GET['id'] ?? 0;
-        $survey = $questionnaire->get($surveyId);
-        
-        if (!$survey) die('Survey not found');
-        
-        $viewError = null;
-        
-        if ($survey['identity_mode'] === 'access_code' && isset($_POST['access_code'])) {
-            $db = Database::getInstance();
-            $codeData = $db->validateAccessCode($surveyId, $_POST['access_code']);
-            if (!$codeData) {
-                $viewError = 'Invalid or already used access code';
-            }
-        }
-        
-        $questions = $questionnaire->getQuestions($surveyId);
-        
-        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-            if (isset($viewError)) {
-                // Invalid access code, don't process
-            } else {
-                $db = Database::getInstance();
-                $respondentName = null;
-                $studentNumber = null;
-                $accessCodeId = null;
-                
-                if ($survey['identity_mode'] === 'identified') {
-                    $respondentName = $_POST['respondent_name'] ?? '';
-                    $studentNumber = $_POST['student_number'] ?? '';
-                } elseif ($survey['identity_mode'] === 'access_code') {
-                    $codeData = $db->validateAccessCode($surveyId, $_POST['access_code'] ?? '');
-                    if ($codeData) $accessCodeId = $codeData['id'];
-                }
-                
-                $responseId = $responseHandler->createResponse($surveyId, $respondentName, $studentNumber, $accessCodeId);
-                
-                if ($accessCodeId) $db->markAccessCodeUsed($accessCodeId);
-                
-                foreach ($_POST as $key => $value) {
-                    if (strpos($key, 'question_') === 0) {
-                        $questionId = (int)str_replace('question_', '', $key);
-                        $responseHandler->saveAnswer($responseId, $questionId, $value);
-                    }
-                }
-                
-                $submitted = true;
-            }
-        }
-        break;
-        
-    case 'results':
-        if (!isLoggedIn()) redirect('index.php?page=login');
-        $surveyId = isset($_GET['id']) ? (int)$_GET['id'] : 0;
-        
-        if (!$surveyId) {
-            $error = "No survey selected";
-            break;
-        }
-        
-        $survey = $questionnaire->get($surveyId);
-        
-        if (!$survey || $survey['user_id'] != getCurrentUser()['id']) {
-            $error = "Survey not found or access denied";
-            break;
-        }
-        
-        $responses = $responseHandler->getResponses($surveyId);
-        $questions = $questionnaire->getQuestions($surveyId);
-        $totalResponses = count($responses);
-        
-        if (isset($_GET['action']) && $_GET['action'] === 'export') {
-            header('Content-Type: text/csv');
-            header('Content-Disposition: attachment; filename=results_' . $surveyId . '.csv');
-            
-            $out = fopen('php://output', 'w');
-            fputcsv($out, array('Response ID', 'Submitted', 'Name', 'Student Number'));
-            
-            foreach ($responses as $r) {
-                fputcsv($out, array($r['id'], $r['submitted_at'], $r['respondent_name'] ?? '', $r['student_number'] ?? ''));
-            }
-            
-            fclose($out);
-            exit;
-        }
-        break;
-        
-    default:
-        if (!isLoggedIn()) {
-            $page = 'login';
-            break;
-        }
-        if ($page === 'dashboard' || $page === '') {
-            $currentUser = getCurrentUser();
-            if ($currentUser && isset($currentUser['id'])) {
-                $userId = $currentUser['id'];
-                $surveys = $questionnaire->getAll($userId);
-                $totalSurveys = count($surveys);
-                $totalResponses = 0;
-                foreach ($surveys as $s) {
-                    $stats = $questionnaire->getStats($s['id']);
-                    $totalResponses += $stats['total_responses'];
-                }
-            }
-        }
-        break;
+// Public pages (no login needed)
+if ($page === 'login') {
+    if (isLoggedIn()) redirect('index.php');
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $result = $auth->login($_POST['username'] ?? '', $_POST['password'] ?? '', $_POST['admin_key'] ?? '');
+        if ($result['success']) redirect('index.php');
+        else $error = $result['error'];
+    }
+    $pageTitle = 'Login';
+    include TEMPLATES_DIR . '/header.php';
+    ?>
+    <div class="card" style="max-width: 400px; margin: 3rem auto;">
+        <h1 class="card-title text-center">System Login</h1>
+        <?php if (isset($error)): ?>
+        <div class="alert alert-error"><?php echo sanitize($error); ?></div>
+        <?php endif; ?>
+        <form method="POST">
+            <div class="form-group">
+                <label class="form-label">Username</label>
+                <input type="text" name="username" class="form-input" required>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Password</label>
+                <input type="password" name="password" class="form-input" required>
+            </div>
+            <button type="submit" class="btn btn-primary w-100">Login</button>
+        </form>
+        <p class="text-center mt-2 text-sm text-muted">Take a survey? <a href="index.php?page=public">Browse surveys</a></p>
+    </div>
+    <?php
+    include TEMPLATES_DIR . '/footer.php';
+    exit;
 }
 
-include TEMPLATES_DIR . '/header.php';
+if ($page === 'logout') {
+    $auth->logout();
+    redirect('index.php');
+    exit;
+}
 
-switch ($page) {
-    case 'login':
-        ?>
-        <div class="card" style="max-width: 400px; margin: 3rem auto;">
-            <h1 class="card-title text-center">Login</h1>
-            
-            <?php if (isset($error)): ?>
-            <div class="alert alert-error"><?php echo sanitize($error); ?></div>
+// Public survey listing (no login needed)
+if ($page === 'public') {
+    $search = $_GET['q'] ?? '';
+    $filterCategory = $_GET['cat'] ?? '';
+    $allSurveys = $questionnaire->getAllPublic();
+    $publicSurveys = [];
+    $now = date('Y-m-d H:i:s');
+
+    // Extract unique categories
+    $categories = [];
+    foreach ($allSurveys as $s) {
+        $cat = $s['category'] ?? 'General';
+        if (!in_array($cat, $categories)) $categories[] = $cat;
+    }
+
+    foreach ($allSurveys as $s) {
+        $active = true;
+        if (!empty($search)) {
+            if (stripos($s['title'], $search) === false && stripos($s['category'], $search) === false && stripos($s['description'] ?? '', $search) === false) {
+                $active = false;
+            }
+        }
+        if (!empty($filterCategory) && ($s['category'] ?? 'General') !== $filterCategory) {
+            $active = false;
+        }
+        if ($active && !empty($s['start_date']) && $now < $s['start_date']) $active = false;
+        if ($active && !empty($s['end_date']) && $now > $s['end_date']) $active = false;
+        if ($active) $publicSurveys[] = $s;
+    }
+    $pageTitle = 'Available Surveys';
+    include TEMPLATES_DIR . '/header.php';
+    ?>
+    <div class="page-header">
+        <h1 class="page-title">Available Surveys</h1>
+        <p class="page-subtitle">Browse and participate in public surveys</p>
+    </div>
+    <form method="GET" action="index.php" class="mb-3" style="max-width:500px;">
+        <input type="hidden" name="page" value="public">
+        <div class="form-group" style="display:flex;gap:.5rem;">
+            <input type="text" name="q" class="form-input" placeholder="Search surveys by name, category, or description..." value="<?php echo htmlspecialchars($search ?? ''); ?>">
+            <button type="submit" class="btn btn-primary">Search</button>
+            <?php if (!empty($search) || !empty($filterCategory)): ?>
+            <a href="index.php?page=public" class="btn btn-ghost">Clear</a>
             <?php endif; ?>
-            
-            <form method="POST">
-                <div class="form-group">
-                    <label class="form-label">Username</label>
-                    <input type="text" name="username" class="form-input" required>
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-label">Password</label>
-                    <input type="password" name="password" class="form-input" required>
-                </div>
-                
-                <button type="submit" class="btn btn-primary" style="width: 100%;">Login</button>
-            </form>
-            
-            <p class="text-center mt-3 text-sm">
-                Don't have an account? <a href="index.php?page=register">Register</a>
-            </p>
         </div>
-        <?php
-        break;
-        
-    case 'register':
-        ?>
-        <div class="card" style="max-width: 450px; margin: 3rem auto;">
-            <h1 class="card-title text-center">Create Account</h1>
-            
-            <?php if (isset($error)): ?>
-            <div class="alert alert-error"><?php echo sanitize($error); ?></div>
-            <?php endif; ?>
-            
-            <form method="POST">
-                <div class="flex gap-2 mb-2">
-                    <div class="form-group" style="flex: 1;">
-                        <label class="form-label">First Name *</label>
-                        <input type="text" name="first_name" class="form-input" required>
-                    </div>
-                    <div class="form-group" style="flex: 1;">
-                        <label class="form-label">Last Name *</label>
-                        <input type="text" name="last_name" class="form-input" required>
-                    </div>
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-label">Username *</label>
-                    <input type="text" name="username" class="form-input" required>
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-label">Email</label>
-                    <input type="email" name="email" class="form-input">
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-label">Contact</label>
-                    <input type="text" name="contact" class="form-input" placeholder="Phone or address">
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-label">Password *</label>
-                    <input type="password" name="password" class="form-input" required>
-                </div>
-                
-                <button type="submit" class="btn btn-primary" style="width: 100%;">Create Account</button>
-            </form>
-            
-            <p class="text-center mt-3 text-sm">
-                Already have an account? <a href="index.php?page=login">Login</a>
-            </p>
-        </div>
-        <?php
-        break;
-        
-    case 'surveys':
-        ?>
-        <div class="page-header">
-            <div class="flex justify-between items-center">
-                <div>
-                    <h1 class="page-title">My Surveys</h1>
-                    <p class="page-subtitle">Manage your questionnaires</p>
-                </div>
-                <a href="index.php?page=create" class="btn btn-primary">Create Survey</a>
+    </form>
+    <?php if (!empty($categories)): ?>
+    <div class="mb-3">
+        <span class="text-sm text-muted" style="margin-right:.5rem;">Filter by:</span>
+        <a href="index.php?page=public<?php echo !empty($search) ? '&q=' . urlencode($search) : ''; ?>" class="btn btn-sm <?php echo empty($filterCategory) ? 'btn-primary' : 'btn-ghost'; ?>">All</a>
+        <?php foreach ($categories as $cat): ?>
+        <a href="index.php?page=public&cat=<?php echo urlencode($cat); ?><?php echo !empty($search) ? '&q=' . urlencode($search) : ''; ?>" class="btn btn-sm <?php echo $filterCategory === $cat ? 'btn-primary' : 'btn-ghost'; ?>"><?php echo sanitize($cat); ?></a>
+        <?php endforeach; ?>
+    </div>
+    <?php endif; ?>
+    <?php if (empty($publicSurveys)): ?>
+    <div class="empty-state">
+        <div class="empty-state-title">No surveys available right now</div>
+        <p class="text-muted">Check back later or contact the administrator</p>
+    </div>
+    <?php else: ?>
+    <div class="grid gap-3">
+        <?php foreach ($publicSurveys as $s): ?>
+        <div class="card flex justify-between items-start">
+            <div>
+                <h3 class="card-title"><?php echo sanitize($s['title']); ?></h3>
+                <p><?php echo sanitize($s['description'] ?? ''); ?></p>
+                <p class="text-sm text-muted">
+                    Category: <?php echo sanitize($s['category'] ?? 'General'); ?> |
+                    Mode: <?php echo IDENTITY_MODES[$s['identity_mode']] ?? ''; ?>
+                </p>
             </div>
+            <a href="index.php?page=view&id=<?php echo $s['id']; ?>" class="btn btn-primary">Take Survey</a>
         </div>
-        
-        <?php if (empty($surveys)): ?>
-        <div class="empty-state">
-            <div class="empty-state-title">No surveys yet</div>
-            <p>Create your first survey</p>
-            <a href="index.php?page=create" class="btn btn-primary mt-2">Create Survey</a>
-        </div>
-        <?php else: ?>
-        <div class="card">
-            <table class="table">
-                <thead>
-                    <tr>
-                        <th>Title</th>
-                        <th>Mode</th>
-                        <th>Questions</th>
-                        <th>Status</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <?php foreach ($surveys as $s): ?>
-                    <?php 
-                        $status = getQuestionnaireStatus($s);
-                        $statusClass = $status === 'active' ? 'badge-success' : ($status === 'expired' ? 'badge-warning' : 'badge-primary');
-                    ?>
-                    <tr>
-                        <td><a href="index.php?page=edit&id=<?php echo $s['id']; ?>"><?php echo sanitize($s['title']); ?></a></td>
-                        <td><span class="badge badge-primary"><?php echo IDENTITY_MODES[$s['identity_mode']] ?? 'Anonymous'; ?></span></td>
-                        <td><?php echo $s['questions_count']; ?></td>
-                        <td><span class="badge <?php echo $statusClass; ?>"><?php echo ucfirst($status); ?></span></td>
-                        <td>
-                            <div class="flex gap-1">
-                                <a href="index.php?page=edit&id=<?php echo $s['id']; ?>" class="btn btn-sm btn-ghost">Edit</a>
-                                <a href="index.php?page=view&id=<?php echo $s['id']; ?>" class="btn btn-sm btn-ghost" target="_blank">View</a>
-                                <a href="index.php?page=results&id=<?php echo $s['id']; ?>" class="btn btn-sm btn-ghost">Results</a>
-                                <a href="index.php?page=delete&id=<?php echo $s['id']; ?>" class="btn btn-sm btn-ghost" onclick="return confirmAction('Delete?')">Delete</a>
-                            </div>
-                        </td>
-                    </tr>
-                    <?php endforeach; ?>
-                </tbody>
-            </table>
-        </div>
-        <?php endif; ?>
-        <?php
-        break;
-        
-    case 'create':
-        ?>
-        <div class="page-header">
-            <h1 class="page-title">Create New Survey</h1>
-            <p class="page-subtitle">Set up your questionnaire</p>
-        </div>
-        
-        <div class="card">
-            <form method="POST">
-                <div class="form-group">
-                    <label class="form-label">Survey Title *</label>
-                    <input type="text" name="title" class="form-input" placeholder="Enter title" required>
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-label">Description</label>
-                    <textarea name="description" class="form-textarea" placeholder="Describe your survey"></textarea>
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-label">Identity Mode *</label>
-                    <select name="identity_mode" class="form-select" required>
-                        <option value="anonymous">Anonymous - No identification</option>
-                        <option value="identified">Identified - Name & student number</option>
-                        <option value="access_code">Access Code - One-time codes</option>
-                    </select>
-                </div>
-                
-                <div class="form-group" id="codesGroup" style="display: none;">
-                    <label class="form-label">Number of Access Codes</label>
-                    <input type="number" name="access_codes_count" class="form-input" placeholder="e.g., 30" min="1">
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-label">Start Date</label>
-                    <input type="datetime-local" name="start_date" class="form-input">
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-label">End Date</label>
-                    <input type="datetime-local" name="end_date" class="form-input">
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-check">
-                        <input type="checkbox" name="allow_multiple" value="1" class="form-check-input">
-                        <span>Allow multiple responses</span>
-                    </label>
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-check">
-                        <input type="checkbox" name="is_active" value="1" class="form-check-input" checked>
-                        <span>Active</span>
-                    </label>
-                </div>
-                
-                <button type="submit" class="btn btn-primary">Create Survey</button>
-                <a href="index.php?page=surveys" class="btn btn-ghost">Cancel</a>
-            </form>
-        </div>
-        
-        <script>
-            document.querySelector('select[name="identity_mode"]').addEventListener('change', function() {
-                document.getElementById('codesGroup').style.display = this.value === 'access_code' ? 'block' : 'none';
-            });
-        </script>
-        <?php
-        break;
-        
-    case 'edit':
-        ?>
-        <div class="page-header">
-            <div class="flex justify-between items-center">
-                <div>
-                    <h1 class="page-title">Edit Survey</h1>
-                    <p class="page-subtitle"><?php echo sanitize($survey['title']); ?></p>
-                </div>
-                <a href="index.php?page=view&id=<?php echo $surveyId; ?>" class="btn btn-primary" target="_blank">Preview</a>
-            </div>
-        </div>
-        
-        <div class="card mb-3">
-            <form method="POST">
-                <input type="hidden" name="update_survey" value="1">
-                
-                <div class="form-group">
-                    <label class="form-label">Title</label>
-                    <input type="text" name="title" class="form-input" value="<?php echo sanitize($survey['title']); ?>">
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-label">Description</label>
-                    <textarea name="description" class="form-textarea"><?php echo sanitize($survey['description']); ?></textarea>
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-label">Identity Mode</label>
-                    <select name="identity_mode" class="form-select">
-                        <option value="anonymous" <?php echo $survey['identity_mode'] === 'anonymous' ? 'selected' : ''; ?>>Anonymous - No identification</option>
-                        <option value="identified" <?php echo $survey['identity_mode'] === 'identified' ? 'selected' : ''; ?>>Identified - Name & student number</option>
-                        <option value="access_code" <?php echo $survey['identity_mode'] === 'access_code' ? 'selected' : ''; ?>>Access Code - One-time codes</option>
-                    </select>
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-check">
-                        <input type="checkbox" name="is_active" value="1" <?php echo $survey['is_active'] ? 'checked' : ''; ?> class="form-check-input">
-                        <span>Active</span>
-                    </label>
-                </div>
-                
-                <button type="submit" class="btn btn-primary btn-sm">Save Changes</button>
-            </form>
-        </div>
-        
-        <div class="card">
-            <h2 class="card-title">Questions (<?php echo count($questions); ?>)</h2>
-            
-            <?php if (empty($questions)): ?>
-            <p class="text-muted mb-3">No questions yet. Add your first question below.</p>
-            <?php else: ?>
-            <?php foreach ($questions as $index => $q): ?>
-            <?php 
-                $rawOpts = $q['options'] ?? '';
-                $qOptions = is_array($rawOpts) ? $rawOpts : json_decode($rawOpts, true);
-                if (!is_array($qOptions)) $qOptions = array();
-            ?>
-            <div class="question-item">
-                <div class="flex justify-between items-center">
-                    <div>
-                        <span class="badge badge-primary mr-1"><?php echo $index + 1; ?></span>
-                        <strong><?php echo sanitize($q['question_text']); ?></strong>
-                        <span class="badge badge-warning ml-1"><?php echo ucfirst(str_replace('_', ' ', $q['type'])); ?></span>
-                    </div>
-                    <form method="POST" class="flex gap-1">
-                        <input type="hidden" name="question_id" value="<?php echo $q['id']; ?>">
-                        <button type="submit" name="delete_question" value="1" class="btn btn-sm btn-ghost" onclick="return confirmAction('Delete?')">Delete</button>
-                    </form>
-                </div>
-                <?php if ($q['type'] === 'multiple_choice' && !empty($qOptions)): ?>
-                <div class="mt-1 text-sm text-muted">Options: <?php echo implode(', ', array_map('sanitize', $qOptions)); ?></div>
+        <?php endforeach; ?>
+    </div>
+    <?php endif; ?>
+
+    <?php
+    // Show "Coming Soon" section for pending surveys
+    $pendingSurveys = [];
+    foreach ($allSurveys as $s) {
+        if (!empty($s['start_date']) && $now < $s['start_date']) {
+            $matches = true;
+            if (!empty($search)) {
+                if (stripos($s['title'], $search) === false && stripos($s['category'], $search) === false && stripos($s['description'] ?? '', $search) === false) {
+                    $matches = false;
+                }
+            }
+            if ($matches) $pendingSurveys[] = $s;
+        }
+    }
+    ?>
+    <?php if (!empty($pendingSurveys)): ?>
+    <div class="mt-3">
+        <h3 class="card-title" style="border-bottom: 2px solid #e5e7eb; padding-bottom: .5rem;">
+            🕐 Coming Soon — <?php echo count($pendingSurveys); ?> survey<?php echo count($pendingSurveys) > 1 ? 's' : ''; ?>
+        </h3>
+        <p class="text-muted text-sm mb-2">These surveys are not yet available. Check back at the start date.</p>
+        <div class="grid gap-2">
+            <?php foreach ($pendingSurveys as $s): ?>
+            <div class="card" style="opacity: 0.7; background: #f9fafb;">
+                <h4 class="card-title" style="margin:0 0 .25rem; font-size:1rem;"><?php echo sanitize($s['title']); ?></h4>
+                <p class="text-sm text-muted" style="margin:0;">
+                    Opens: <strong><?php echo date('M d, Y \a\t h:i A', strtotime($s['start_date'])); ?></strong>
+                    <?php if (!empty($s['end_date'])): ?>
+                    &nbsp;|&nbsp; Closes: <strong><?php echo date('M d, Y \a\t h:i A', strtotime($s['end_date'])); ?></strong>
+                    <?php endif; ?>
+                </p>
+                <?php if (!empty($s['category'])): ?>
+                <p class="text-sm text-muted" style="margin:0;">Category: <?php echo sanitize($s['category']); ?></p>
                 <?php endif; ?>
             </div>
             <?php endforeach; ?>
-            <?php endif; ?>
-            
-            <h3 class="mt-3 mb-2">Add Question</h3>
-            <form method="POST">
-                <input type="hidden" name="add_question" value="1">
-                
-                <div class="form-group">
-                    <label class="form-label">Question Type</label>
-                    <select name="type" class="form-select" id="questionType">
-                        <option value="multiple_choice">Multiple Choice</option>
-                        <option value="likert_5">Likert Scale (1-5)</option>
-                        <option value="short_text">Short Text</option>
-                        <option value="long_text">Long Text</option>
-                        <option value="yes_no">Yes/No</option>
-                        <option value="date">Date</option>
-                        <option value="number">Number</option>
-                    </select>
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-label">Question Text *</label>
-                    <input type="text" name="question_text" class="form-input" placeholder="Enter question" required>
-                </div>
-                
-                <div class="form-group" id="optionsContainer" style="display: none;">
-                    <label class="form-label">Options</label>
-                    <div id="optionFields">
-                        <input type="text" name="options[]" class="form-input mb-1" placeholder="Option 1">
-                        <input type="text" name="options[]" class="form-input mb-1" placeholder="Option 2">
-                        <input type="text" name="options[]" class="form-input mb-1" placeholder="Option 3">
-                        <input type="text" name="options[]" class="form-input mb-1" placeholder="Option 4">
-                    </div>
-                    <button type="button" class="btn btn-sm btn-ghost" onclick="addOption()">+ Add Option</button>
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-check">
-                        <input type="checkbox" name="required" value="1" class="form-check-input">
-                        <span>Required</span>
-                    </label>
-                </div>
-                
-                <button type="submit" class="btn btn-primary">Add Question</button>
-            </form>
         </div>
-        
-        <script>
-            var optCount = 4;
-            document.getElementById('questionType').addEventListener('change', function() {
-                document.getElementById('optionsContainer').style.display = this.value === 'multiple_choice' ? 'block' : 'none';
-            });
-            function addOption() {
-                optCount++;
-                var inp = document.createElement('input');
-                inp.type = 'text';
-                inp.name = 'options[]';
-                inp.className = 'form-input mb-1';
-                inp.placeholder = 'Option ' + optCount;
-                document.getElementById('optionFields').appendChild(inp);
+    </div>
+    <?php endif; ?>
+    <?php
+    include TEMPLATES_DIR . '/footer.php';
+    exit;
+}
+
+// View survey (public - no login needed)
+if ($page === 'view') {
+    $surveyId = (int)($_GET['id'] ?? 0);
+    $survey = $questionnaire->get($surveyId);
+    if (!$survey) die('Survey not found');
+    $questions = $questionnaire->getQuestions($surveyId);
+
+    $viewError = null;
+    $accessCodeValid = false;
+    $now = date('Y-m-d H:i:s');
+
+    if (!empty($survey['start_date']) && $now < $survey['start_date']) {
+        $viewError = 'This survey has not started yet';
+    } elseif (!empty($survey['end_date']) && $now > $survey['end_date']) {
+        $viewError = 'This survey has expired';
+    } elseif (!$survey['is_active']) {
+        $viewError = 'This survey is not active';
+    }
+
+    // Handle access code validation
+    if ($survey['identity_mode'] === 'access_code') {
+        if (isset($_POST['access_code']) && empty($viewError)) {
+            $codeData = $db->validateAccessCode($surveyId, $_POST['access_code']);
+            if ($codeData) {
+                $accessCodeValid = true;
+                $_SESSION['access_code_valid_' . $surveyId] = $_POST['access_code'];
+            } else {
+                unset($_SESSION['access_code_valid_' . $surveyId]);
+                $viewError = 'Invalid or already used access code';
             }
-        </script>
-        <?php
-        break;
-        
-    case 'view':
-        ?>
-        <?php if (isset($submitted)): ?>
-        <div class="alert alert-success">Thank you for your response!</div>
-        <?php endif; ?>
-        
-        <?php if (isset($viewError)): ?>
-        <div class="alert alert-error"><?php echo sanitize($viewError); ?></div>
-        <?php endif; ?>
-        
-        <?php if (empty($questions)): ?>
-        <div class="alert alert-warning">This survey has no questions yet. Please contact the survey creator.</div>
-        <?php endif; ?>
-        
-        <div class="card" style="max-width: 700px; margin: 0 auto;">
-            <h1 class="card-title"><?php echo sanitize($survey['title']); ?></h1>
-            <?php if ($survey['description']): ?>
-            <p class="text-muted mb-3"><?php echo sanitize($survey['description']); ?></p>
-            <?php endif; ?>
-            
-            <?php if ($survey['identity_mode'] === 'identified'): ?>
-            <div class="card mb-3" style="background: #f0f7ff;">
-                <h3 class="card-title">Your Information</h3>
-                <form method="POST">
-                    <div class="form-group">
-                        <label class="form-label">Name *</label>
-                        <input type="text" name="respondent_name" class="form-input" required>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">Student Number *</label>
-                        <input type="text" name="student_number" class="form-input" required>
-                    </div>
-            <?php elseif ($survey['identity_mode'] === 'access_code'): ?>
-            <div class="card mb-3" style="background: #f0f7ff;">
-                <h3 class="card-title">Access Code Required</h3>
-                <form method="POST">
-                    <div class="form-group">
-                        <label class="form-label">Enter Access Code *</label>
-                        <input type="text" name="access_code" class="form-input" placeholder="e.g., A1B2C3D4" required>
-                    </div>
-            <?php else: ?>
-            <form method="POST">
-            <?php endif; ?>
-            
-                <?php foreach ($questions as $index => $q): ?>
-                <?php 
-                $type = $q['type'];
-                $rawOptions = $q['options'] ?? '';
-                $options = is_array($rawOptions) ? $rawOptions : json_decode($rawOptions, true);
-                if (!is_array($options)) $options = array();
-                if ($type === 'multiple_choice' && empty($options)) {
-                    $options = ['Option A', 'Option B', 'Option C', 'Option D', 'Option E'];
-                }
-                ?>
-                <div class="form-group">
-                    <label class="form-label">
-                        <?php echo $index + 1; ?>. <?php echo sanitize($q['question_text']); ?>
-                        <?php if ($q['required']): ?><span style="color: red;"> *</span><?php endif; ?>
-                    </label>
-                    
-                    <?php if ($type === 'short_text'): ?>
-                    <input type="text" name="question_<?php echo $q['id']; ?>" class="form-input" <?php echo $q['required'] ? 'required' : ''; ?>>
-                    
-                    <?php elseif ($type === 'long_text'): ?>
-                    <textarea name="question_<?php echo $q['id']; ?>" class="form-textarea" <?php echo $q['required'] ? 'required' : ''; ?>></textarea>
-                    
-                    <?php elseif ($type === 'multiple_choice'): ?>
-                    <?php foreach ($options as $opt): ?>
-                    <label class="form-check">
-                        <input type="radio" name="question_<?php echo $q['id']; ?>" value="<?php echo sanitize($opt); ?>" class="form-check-input" <?php echo $q['required'] ? 'required' : ''; ?>>
-                        <span><?php echo sanitize($opt); ?></span>
-                    </label>
-                    <?php endforeach; ?>
-                    
-                    <?php elseif ($type === 'likert_5'): ?>
-                    <div class="flex gap-2">
-                        <?php for ($i = 1; $i <= 5; $i++): ?>
-                        <label class="form-check">
-                            <input type="radio" name="question_<?php echo $q['id']; ?>" value="<?php echo $i; ?>" class="form-check-input" <?php echo $q['required'] ? 'required' : ''; ?>>
-                            <span><?php echo $i; ?></span>
-                        </label>
-                        <?php endfor; ?>
-                    </div>
-                    <small class="text-muted">1 = Strongly Disagree, 2 = Disagree, 3 = Neutral, 4 = Agree, 5 = Strongly Agree</small>
-                    
-                    <?php elseif ($type === 'yes_no'): ?>
-                    <label class="form-check">
-                        <input type="radio" name="question_<?php echo $q['id']; ?>" value="Yes" class="form-check-input" <?php echo $q['required'] ? 'required' : ''; ?>>
-                        <span>Yes</span>
-                    </label>
-                    <label class="form-check">
-                        <input type="radio" name="question_<?php echo $q['id']; ?>" value="No" class="form-check-input">
-                        <span>No</span>
-                    </label>
-                    
-                    <?php elseif ($type === 'number'): ?>
-                    <input type="number" name="question_<?php echo $q['id']; ?>" class="form-input" <?php echo $q['required'] ? 'required' : ''; ?>>
-                    
-                    <?php elseif ($type === 'date'): ?>
-                    <input type="date" name="question_<?php echo $q['id']; ?>" class="form-input" <?php echo $q['required'] ? 'required' : ''; ?>>
-                    
-                    <?php endif; ?>
-                </div>
-                <?php endforeach; ?>
-                
-                <?php if (!empty($questions)): ?>
-                <button type="submit" class="btn btn-primary">Submit</button>
-                <?php endif; ?>
-            </form>
-        </div>
-        <?php
-        break;
-        
-    case 'results':
-        ?>
-        <?php if (isset($error)): ?>
-        <div class="card">
-            <div class="alert alert-error"><?php echo sanitize($error); ?></div>
-            <a href="index.php?page=surveys" class="btn btn-primary">Back to My Surveys</a>
-        </div>
-        <?php else: ?>
-        
-        <div class="page-header">
-            <div class="flex justify-between items-center">
-                <div>
-                    <h1 class="page-title">Results: <?php echo sanitize($survey['title']); ?></h1>
-                    <p class="page-subtitle"><?php echo $totalResponses; ?> responses</p>
-                </div>
-                <a href="index.php?page=results&id=<?php echo $surveyId; ?>&action=export" class="btn btn-primary">Export CSV</a>
-            </div>
-        </div>
-        
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-        
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-value"><?php echo $totalResponses; ?></div>
-                <div class="stat-label">Total Responses</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value"><?php echo count($questions); ?></div>
-                <div class="stat-label">Questions</div>
-            </div>
-        </div>
-        
-        <?php
-        function analyzeQuestion($questionId, $type, $responses, $responseHandler) {
-            $allAnswers = array();
-            foreach ($responses as $resp) {
-                $answers = $responseHandler->getAnswers($resp['id']);
-                if (isset($answers[$questionId])) {
-                    $allAnswers[] = $answers[$questionId];
+        } elseif (isset($_SESSION['access_code_valid_' . $surveyId])) {
+            $accessCodeValid = true;
+        }
+    }
+
+    // Handle identity step for 'identified' mode
+    $identifySubmitted = false;
+    if ($survey['identity_mode'] === 'identified') {
+        if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['identify_step'])) {
+            $respondentName = trim($_POST['respondent_name'] ?? '');
+            $surname = trim($_POST['surname'] ?? '');
+            $studentNumber = trim($_POST['student_number'] ?? '');
+            $email = trim($_POST['email'] ?? '');
+            $requireEmail = !empty($survey['collect_email']);
+            $requireStudentNumber = !empty($survey['collect_student_number']);
+
+            $idError = '';
+            if (empty($respondentName) || empty($surname)) {
+                $idError = 'Name and Surname are required.';
+            } elseif ($requireEmail && empty($email)) {
+                $idError = 'Email is required.';
+            } elseif ($requireStudentNumber && empty($studentNumber)) {
+                $idError = 'Student Number is required.';
+            }
+
+            if (empty($idError)) {
+                $_SESSION['survey_identity'] = [
+                    'respondent_name' => $respondentName,
+                    'surname' => $surname,
+                    'student_number' => $studentNumber,
+                    'email' => $email
+                ];
+                $identifySubmitted = true;
+            } else {
+                $viewError = $idError;
+            }
+        } elseif (isset($_SESSION['survey_identity'])) {
+            $identifySubmitted = true;
+        }
+    } else {
+        $identifySubmitted = true;
+    }
+
+    // Handle survey response submission
+    $submitted = false;
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && empty($_POST['access_code']) && empty($_POST['identify_step'])) {
+        $respondentName = null;
+        $studentNumber = null;
+        $email = null;
+        $accessCodeId = null;
+
+        $isSubmission = false;
+        foreach ($_POST as $key => $value) {
+            if (strpos($key, 'question_') === 0) {
+                $isSubmission = true;
+                break;
+            }
+        }
+
+        if ($isSubmission && $identifySubmitted) {
+            if ($survey['identity_mode'] === 'identified') {
+                $ident = $_SESSION['survey_identity'] ?? [];
+                $firstName = $ident['respondent_name'] ?? '';
+                $surname = $ident['surname'] ?? '';
+                $respondentName = ($firstName && $surname) ? $firstName . ' ' . $surname : ($surname ?: $firstName);
+                $studentNumber = $ident['student_number'] ?? null;
+                $email = $ident['email'] ?? null;
+                unset($_SESSION['survey_identity']);
+            } elseif ($survey['identity_mode'] === 'access_code' && $accessCodeValid) {
+                $codeData = $db->validateAccessCode($surveyId, $_SESSION['access_code_valid_' . $surveyId] ?? '');
+                if ($codeData) {
+                    $accessCodeId = $codeData['id'];
                 }
             }
-            
-            $result = array('total' => count($allAnswers), 'data' => array());
-            
-            if ($type === 'multiple_choice') {
-                $counts = array();
-                foreach ($allAnswers as $ans) {
-                    $val = is_array($ans) ? implode(', ', $ans) : $ans;
-                    $counts[$val] = ($counts[$val] ?? 0) + 1;
+
+            if (!$survey['allow_multiple'] && $accessCodeId) {
+                $existing = $db->queryResponse("SELECT id FROM responses WHERE access_code_id = ?", [$accessCodeId]);
+                if (!empty($existing)) {
+                    $viewError = 'This access code has already been used';
                 }
-                arsort($counts);
-                $total = count($allAnswers);
-                foreach ($counts as $opt => $cnt) {
-                    $result['data'][] = array('option' => $opt, 'count' => $cnt, 'percentage' => $total > 0 ? round(($cnt / $total) * 100, 1) : 0);
+            }
+
+            if (!$viewError) {
+                $responseId = $response->createResponse($surveyId, $respondentName, $studentNumber, $email, $accessCodeId);
+
+                if ($accessCodeId) {
+                    $db->markAccessCodeUsed($accessCodeId);
+                    unset($_SESSION['access_code_valid_' . $surveyId]);
                 }
-            } elseif ($type === 'likert_5') {
-                $counts = array(1 => 0, 2 => 0, 3 => 0, 4 => 0, 5 => 0);
-                $sum = 0;
-                $valid = 0;
-                foreach ($allAnswers as $ans) {
-                    $val = is_numeric($ans) ? (int)$ans : 0;
-                    if ($val >= 1 && $val <= 5) {
-                        $counts[$val]++;
-                        $sum += $val;
-                        $valid++;
+
+                foreach ($_POST as $key => $value) {
+                    if (strpos($key, 'question_') === 0) {
+                        $qid = (int)str_replace('question_', '', $key);
+                        $response->saveAnswer($responseId, $qid, $value);
                     }
                 }
-                $result['data'] = array('counts' => $counts, 'average' => $valid > 0 ? round($sum / $valid, 2) : 0, 'total' => $valid);
-            } elseif ($type === 'yes_no') {
-                $yes = count(array_filter($allAnswers, fn($a) => strtolower($a) === 'yes'));
-                $result['data'] = array('yes' => $yes, 'no' => count($allAnswers) - $yes);
-            } elseif (in_array($type, ['short_text', 'long_text'])) {
-                $result['data'] = array('responses' => array_filter($allAnswers, fn($a) => !empty(trim($a))));
-            } elseif ($type === 'number') {
-                $nums = array_filter($allAnswers, 'is_numeric');
-                if (!empty($nums)) {
-                    $result['data'] = array('average' => round(array_sum($nums) / count($nums), 2), 'min' => min($nums), 'max' => max($nums), 'count' => count($nums));
-                }
+                $submitted = true;
             }
-            
-            return $result;
+        } elseif (!$identifySubmitted) {
+            // Identity not yet provided, show the form
         }
-        
-        foreach ($questions as $index => $q):
-            $analysis = analyzeQuestion($q['id'], $q['type'], $responses, $responseHandler);
-        ?>
-        <div class="card mb-3">
-            <h3 class="card-title">
-                <?php echo ($index + 1) . '. ' . sanitize($q['question_text']); ?>
-                <span class="badge badge-warning ml-1"><?php echo ucfirst(str_replace('_', ' ', $q['type'])); ?></span>
-            </h3>
-            <p class="text-muted"><?php echo $analysis['total']; ?> responses</p>
-            
-            <?php if ($q['type'] === 'multiple_choice'): ?>
-            <div style="max-width: 400px; margin: 1rem 0;">
-                <canvas id="chart_<?php echo $q['id']; ?>"></canvas>
+    }
+
+    $pageTitle = sanitize($survey['title'] ?? 'Survey');
+    include TEMPLATES_DIR . '/header.php';
+    ?>
+    <?php if ($submitted): ?>
+    <div class="alert alert-success" style="max-width:700px;margin:3rem auto;">
+        <h3 style="margin:0 0 .5rem;">Thank you!</h3>
+        <p>Your response has been recorded successfully.</p>
+        <a href="index.php?page=public" class="btn btn-primary mt-2" style="display:inline-block;">Browse More Surveys</a>
+    </div>
+    <?php elseif ($viewError): ?>
+    <div class="alert alert-error" style="max-width:700px;margin:3rem auto;">
+        <?php echo sanitize($viewError); ?>
+    </div>
+    <?php else: ?>
+    <div class="card" style="max-width: 700px; margin: 0 auto;">
+        <h1 class="card-title" style="font-size:1.5rem;"><?php echo sanitize($survey['title']); ?></h1>
+        <?php if ($survey['description']): ?>
+        <p class="text-muted"><?php echo sanitize($survey['description']); ?></p>
+        <?php endif; ?>
+
+        <?php if ($survey['identity_mode'] === 'access_code' && !$accessCodeValid): ?>
+        <p>Enter your access code to participate in this survey:</p>
+        <form method="POST" style="max-width:400px;">
+            <div class="form-group">
+                <label class="form-label">Access Code *</label>
+                <input type="text" name="access_code" class="form-input" placeholder="e.g., A1B2C3D4" required style="text-transform:uppercase;">
             </div>
-            <table class="table">
-                <thead><tr><th>Option</th><th>Count</th><th>%</th></tr></thead>
-                <tbody>
-                    <?php foreach ($analysis['data'] as $r): ?>
-                    <tr><td><?php echo sanitize($r['option']); ?></td><td><?php echo $r['count']; ?></td><td><?php echo $r['percentage']; ?>%</td></tr>
-                    <?php endforeach; ?>
-                </tbody>
-            </table>
-            <script>
-            new Chart(document.getElementById('chart_<?php echo $q['id']; ?>'), {
-                type: 'bar',
-                data: {
-                    labels: <?php echo json_encode(array_column($analysis['data'], 'option')); ?>,
-                    datasets: [{
-                        label: 'Responses',
-                        data: <?php echo json_encode(array_column($analysis['data'], 'count')); ?>,
-                        backgroundColor: '#2563EB',
-                        borderRadius: 4
-                    }]
-                },
-                options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } } }
-            });
-            </script>
-            
-            <?php elseif ($q['type'] === 'likert_5'): ?>
-            <?php $lr = $analysis['data']; ?>
-            <div class="stats-grid mb-2">
-                <div class="stat-card">
-                    <div class="stat-value"><?php echo $lr['average']; ?></div>
-                    <div class="stat-label">Average Score</div>
-                </div>
+            <button type="submit" class="btn btn-primary">Validate Code</button>
+        </form>
+        <?php elseif ($survey['identity_mode'] === 'identified' && !$identifySubmitted): ?>
+        <p class="text-muted mb-2">Please provide your information to participate:</p>
+        <form method="POST" class="card" style="padding:1.5rem;">
+            <input type="hidden" name="identify_step" value="1">
+            <div class="form-group">
+                <label class="form-label">Name *</label>
+                <input type="text" name="respondent_name" class="form-input" required>
             </div>
-            <div style="max-width: 300px; margin: 1rem 0;">
-                <canvas id="chart_<?php echo $q['id']; ?>"></canvas>
+            <div class="form-group">
+                <label class="form-label">Surname *</label>
+                <input type="text" name="surname" class="form-input" required>
             </div>
-            <table class="table">
-                <thead><tr><th>Scale</th><th>Count</th></tr></thead>
-                <tbody>
-                    <?php for ($i = 1; $i <= 5; $i++): ?>
-                    <?php $labels = ['', 'Strongly Disagree', 'Disagree', 'Neutral', 'Agree', 'Strongly Agree']; ?>
-                    <tr><td><?php echo $i . ' - ' . $labels[$i]; ?></td><td><?php echo $lr['counts'][$i] ?? 0; ?></td></tr>
-                    <?php endfor; ?>
-                </tbody>
-            </table>
-            <script>
-            new Chart(document.getElementById('chart_<?php echo $q['id']; ?>'), {
-                type: 'pie',
-                data: {
-                    labels: ['Strongly Disagree', 'Disagree', 'Neutral', 'Agree', 'Strongly Agree'],
-                    datasets: [{
-                        data: <?php echo json_encode(array_values($lr['counts'])); ?>,
-                        backgroundColor: ['#EF4444', '#F97316', '#F59E0B', '#10B981', '#22C55E']
-                    }]
-                },
-                options: { responsive: true }
-            });
-            </script>
-            
-            <?php elseif ($q['type'] === 'yes_no'): ?>
-            <?php $yn = $analysis['data']; ?>
-            <div class="flex gap-2">
-                <div class="stat-card"><div class="stat-value"><?php echo $yn['yes']; ?></div><div class="stat-label">Yes</div></div>
-                <div class="stat-card"><div class="stat-value"><?php echo $yn['no']; ?></div><div class="stat-label">No</div></div>
-            </div>
-            
-            <?php elseif ($q['type'] === 'number' && isset($analysis['data']['average'])): ?>
-            <?php $n = $analysis['data']; ?>
-            <div class="flex gap-2">
-                <div class="stat-card"><div class="stat-value"><?php echo $n['average']; ?></div><div class="stat-label">Average</div></div>
-                <div class="stat-card"><div class="stat-value"><?php echo $n['min']; ?></div><div class="stat-label">Min</div></div>
-                <div class="stat-card"><div class="stat-value"><?php echo $n['max']; ?></div><div class="stat-label">Max</div></div>
-            </div>
-            
-            <?php elseif (in_array($q['type'], ['short_text', 'long_text'])): ?>
-            <?php $txt = $analysis['data']['responses'] ?? array(); ?>
-            <?php if (empty($txt)): ?>
-            <p class="text-muted">No text responses.</p>
-            <?php else: ?>
-            <div style="max-height: 200px; overflow-y: auto; border: 1px solid #eee; padding: 1rem; border-radius: 4px;">
-                <?php foreach ($txt as $t): ?>
-                <div class="mb-2 pb-2" style="border-bottom: 1px solid #eee;"><?php echo sanitize($t); ?></div>
-                <?php endforeach; ?>
+            <?php if (!empty($survey['collect_email'])): ?>
+            <div class="form-group">
+                <label class="form-label">Email *</label>
+                <input type="email" name="email" class="form-input" required>
             </div>
             <?php endif; ?>
+            <?php if (!empty($survey['collect_student_number'])): ?>
+            <div class="form-group">
+                <label class="form-label">Student Number *</label>
+                <input type="text" name="student_number" class="form-input" required>
+            </div>
+            <?php endif; ?>
+            <button type="submit" class="btn btn-primary">Start Survey</button>
+        </form>
+        <?php else: ?>
+        <form method="POST">
+            <?php foreach ($questions as $q): ?>
+            <?php
+            $type = $q['type'];
+            $rawOptions = $q['options'] ?? '';
+            $options = is_array($rawOptions) ? $rawOptions : json_decode($rawOptions, true);
+            if (!is_array($options)) $options = [];
+            if ($type === 'multiple_choice' && empty($options)) {
+                $options = ['A', 'B', 'C', 'D', 'E'];
+            }
+            ?>
+            <div class="form-group">
+                <label class="form-label">
+                    <?php echo sanitize($q['question_text']); ?>
+                    <?php if ($q['required']): ?><span style="color: red;"> *</span><?php endif; ?>
+                </label>
+                <?php if ($type === 'multiple_choice'): ?>
+                    <?php foreach ($options as $opt): ?>
+                    <label class="form-check"><input type="radio" name="question_<?php echo $q['id']; ?>" value="<?php echo sanitize($opt); ?>" class="form-check-input" <?php echo $q['required'] ? 'required' : ''; ?>> <span><?php echo sanitize($opt); ?></span></label>
+                    <?php endforeach; ?>
+                <?php elseif ($type === 'likert_5'): ?>
+                    <div class="flex gap-2" style="flex-wrap:wrap;">
+                        <?php for ($i = 1; $i <= 5; $i++): ?>
+                        <label class="form-check"><input type="radio" name="question_<?php echo $q['id']; ?>" value="<?php echo $i; ?>" class="form-check-input" <?php echo $q['required'] ? 'required' : ''; ?>> <span><?php echo $i; ?></span></label>
+                        <?php endfor; ?>
+                    </div>
+                <?php elseif ($type === 'short_text'): ?>
+                    <input type="text" name="question_<?php echo $q['id']; ?>" class="form-input" <?php echo $q['required'] ? 'required' : ''; ?>>
+                <?php elseif ($type === 'long_text'): ?>
+                    <textarea name="question_<?php echo $q['id']; ?>" class="form-textarea" <?php echo $q['required'] ? 'required' : ''; ?>></textarea>
+                <?php elseif ($type === 'yes_no'): ?>
+                    <label class="form-check"><input type="radio" name="question_<?php echo $q['id']; ?>" value="Yes" class="form-check-input"> <span>Yes</span></label>
+                    <label class="form-check"><input type="radio" name="question_<?php echo $q['id']; ?>" value="No" class="form-check-input"> <span>No</span></label>
+                <?php elseif ($type === 'true_false'): ?>
+                    <label class="form-check"><input type="radio" name="question_<?php echo $q['id']; ?>" value="True" class="form-check-input"> <span>True</span></label>
+                    <label class="form-check"><input type="radio" name="question_<?php echo $q['id']; ?>" value="False" class="form-check-input"> <span>False</span></label>
+                <?php elseif ($type === 'number'): ?>
+                    <input type="number" name="question_<?php echo $q['id']; ?>" class="form-input" <?php echo $q['required'] ? 'required' : ''; ?>>
+                <?php elseif ($type === 'date'): ?>
+                    <input type="date" name="question_<?php echo $q['id']; ?>" class="form-input" <?php echo $q['required'] ? 'required' : ''; ?>>
+                <?php endif; ?>
+            </div>
+            <?php endforeach; ?>
+            <?php if (!empty($questions)): ?>
+            <button type="submit" class="btn btn-primary">Submit Survey</button>
+            <?php endif; ?>
+        </form>
+        <?php endif; ?>
+    </div>
+    <?php endif; ?>
+    <?php
+    include TEMPLATES_DIR . '/footer.php';
+    exit;
+}
+
+// ===== Protected pages (login required) =====
+
+if ($page === '' || $page === 'dashboard') {
+    if (!isLoggedIn()) {
+        redirect('index.php?page=public');
+    }
+    $currentUser = getCurrentUser();
+    $surveys = $questionnaire->getAll($currentUser['id']);
+    $totalResponses = 0;
+    foreach ($surveys as $s) {
+        $stats = $questionnaire->getStats($s['id']);
+        $totalResponses += $stats['total_responses'];
+    }
+    $pageTitle = 'Dashboard';
+    include TEMPLATES_DIR . '/header.php';
+    ?>
+    <div class="page-header">
+        <h1 class="page-title">Dashboard</h1>
+        <p class="page-subtitle">Welcome back, <?php echo sanitize($currentUser['first_name'] ?? $currentUser['username']); ?></p>
+    </div>
+    <div class="flex gap-2 mb-3">
+        <div class="card" style="flex: 1;">
+            <h3 class="card-title">My Surveys</h3>
+            <p style="font-size: 2rem; font-weight: 600;"><?php echo count($surveys); ?></p>
+            <a href="index.php?page=surveys" class="btn btn-sm btn-primary">View All</a>
+        </div>
+        <div class="card" style="flex: 1;">
+            <h3 class="card-title">Total Responses</h3>
+            <p style="font-size: 2rem; font-weight: 600;"><?php echo $totalResponses; ?></p>
+        </div>
+    </div>
+    <a href="index.php?page=create" class="btn btn-primary">Create New Survey</a>
+    <a href="index.php?page=public" class="btn btn-ghost mt-2" style="display:inline-block;">Browse Public Surveys</a>
+    <?php
+    include TEMPLATES_DIR . '/footer.php';
+    exit;
+}
+
+// All remaining pages require login
+if (!isLoggedIn()) {
+    redirect('index.php?page=login');
+}
+
+if ($page === 'surveys') {
+    $surveys = $questionnaire->getAll($currentUser['id']);
+    $pageTitle = 'My Surveys';
+    include TEMPLATES_DIR . '/header.php';
+    ?>
+    <div class="page-header flex justify-between items-center">
+        <div>
+            <h1 class="page-title">My Surveys</h1>
+            <p class="page-subtitle">Manage your questionnaires</p>
+        </div>
+        <a href="index.php?page=create" class="btn btn-primary">Create Survey</a>
+    </div>
+    <?php if (empty($surveys)): ?>
+    <div class="empty-state">
+        <div class="empty-state-title">No surveys yet</div>
+        <a href="index.php?page=create" class="btn btn-primary mt-2">Create Your First Survey</a>
+    </div>
+    <?php else: ?>
+    <div class="card">
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>Title</th>
+                    <th>Category</th>
+                    <th>Mode</th>
+                    <th>Questions</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($surveys as $s): ?>
+                <?php $status = getQuestionnaireStatus($s); ?>
+                <tr>
+                    <td><a href="index.php?page=edit&id=<?php echo $s['id']; ?>"><?php echo sanitize($s['title']); ?></a></td>
+                    <td><?php echo sanitize($s['category'] ?? 'General'); ?></td>
+                    <td><span class="badge badge-primary"><?php echo IDENTITY_MODES[$s['identity_mode']] ?? 'Anonymous'; ?></span></td>
+                    <td><?php echo $s['questions_count']; ?></td>
+                    <td><span class="badge badge-<?php echo $status === 'active' ? 'success' : ($status === 'expired' ? 'warning' : 'primary'); ?>"><?php echo ucfirst($status); ?></span></td>
+                    <td>
+                        <a href="index.php?page=view&id=<?php echo $s['id']; ?>" class="btn btn-sm btn-ghost" target="_blank">Preview</a>
+                        <a href="index.php?page=results&id=<?php echo $s['id']; ?>" class="btn btn-sm btn-ghost">Results</a>
+                        <?php if ($s['identity_mode'] === 'access_code'): ?>
+                        <a href="index.php?page=download_codes&id=<?php echo $s['id']; ?>" class="btn btn-sm btn-ghost">Codes</a>
+                        <?php endif; ?>
+                        <a href="index.php?page=copy&id=<?php echo $s['id']; ?>" class="btn btn-sm btn-ghost" onclick="return confirmAction('Copy this survey? Questions will be duplicated.')">Copy</a>
+                        <a href="index.php?page=delete_survey&id=<?php echo $s['id']; ?>" class="btn btn-sm btn-ghost" onclick="return confirmAction('Delete this survey and all its questions?')">Delete</a>
+                        <?php if ($currentUser['role'] === 'admin'): ?>
+                        <a href="index.php?page=transfer&id=<?php echo $s['id']; ?>" class="btn btn-sm btn-ghost">Transfer</a>
+                        <?php endif; ?>
+                    </td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+    <?php endif; ?>
+    <?php
+    include TEMPLATES_DIR . '/footer.php';
+    exit;
+}
+
+if ($page === 'create') {
+    $pageTitle = 'Create Survey';
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['title'])) {
+        $startRaw = trim($_POST['start_date'] ?? '');
+        $endRaw = trim($_POST['end_date'] ?? '');
+        // HTML datetime-local uses 'T' separator, normalize to space + ensure seconds
+        $startDate = $startRaw ? date('Y-m-d H:i:s', strtotime(str_replace('T', ' ', $startRaw))) : null;
+        $endDate = $endRaw ? date('Y-m-d H:i:s', strtotime(str_replace('T', ' ', $endRaw))) : null;
+        $idExtraField = $_POST['id_extra_field'] ?? 'none';
+        $data = [
+            'title' => $_POST['title'],
+            'description' => $_POST['description'] ?? '',
+            'category' => $_POST['category'] ?? '',
+            'identity_mode' => $_POST['identity_mode'] ?? 'anonymous',
+            'start_date' => $startDate,
+            'end_date' => $endDate,
+            'allow_multiple' => isset($_POST['allow_multiple']) ? 1 : 0,
+            'is_active' => isset($_POST['is_active']) ? 1 : 0,
+            'access_codes_count' => (int)($_POST['access_codes_count'] ?? 0),
+            'collect_email' => $idExtraField === 'email' ? 1 : 0,
+            'collect_student_number' => $idExtraField === 'student_number' ? 1 : 0
+        ];
+        $surveyId = $questionnaire->create($currentUser['id'], $data);
+        redirect('index.php?page=edit&id=' . $surveyId);
+    }
+    include TEMPLATES_DIR . '/header.php';
+    ?>
+    <div class="page-header">
+        <h1 class="page-title">Create New Survey</h1>
+    </div>
+    <div class="card">
+        <form method="POST">
+            <div class="form-group">
+                <label class="form-label">Survey Title *</label>
+                <input type="text" name="title" class="form-input" placeholder="e.g., Course Evaluation 2026" required>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Description</label>
+                <textarea name="description" class="form-textarea" placeholder="Optional description of the survey"></textarea>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Category</label>
+                <input type="text" name="category" class="form-input" placeholder="e.g., Course Evaluation, Feedback">
+            </div>
+            <div class="form-group">
+                <label class="form-check">
+                    <input type="checkbox" name="is_active" value="1" checked class="form-check-input">
+                    <span>Active (available immediately)</span>
+                </label>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Identity Mode *</label>
+                <select name="identity_mode" class="form-select" id="identityModeSelect">
+                    <option value="anonymous">Anonymous - Open to everyone, no identity checked</option>
+                    <option value="identified">Identified - Collect name, surname, and optionally email/student number</option>
+                    <option value="access_code">Access Code - Distribute one-time passwords to participants</option>
+                </select>
+            </div>
+            <div id="identifiedOptions" style="display:none;">
+                <div class="form-group">
+                    <label class="form-label">Collect Optional Field</label>
+                    <div class="radio-group">
+                        <label class="form-check"><input type="radio" name="id_extra_field" value="none" class="form-check-input" checked> <span>None</span></label>
+                        <label class="form-check"><input type="radio" name="id_extra_field" value="email" class="form-check-input"> <span>Email address</span></label>
+                        <label class="form-check"><input type="radio" name="id_extra_field" value="student_number" class="form-check-input"> <span>Student number</span></label>
+                    </div>
+                </div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Number of Access Codes</label>
+                <input type="number" name="access_codes_count" class="form-input" value="0" min="0" max="10000">
+                <small class="text-muted">Set to 0 if no codes needed. Codes can be downloaded later.</small>
+            </div>
+            <button type="submit" class="btn btn-primary">Create Survey</button>
+        </form>
+    </div>
+    <?php
+    include TEMPLATES_DIR . '/footer.php';
+    exit;
+}
+
+if ($page === 'transfer') {
+    $surveyId = (int)($_GET['id'] ?? 0);
+    $survey = $questionnaire->get($surveyId);
+    if (!$survey || $currentUser['role'] !== 'admin') {
+        setMessage('error', 'Survey not found or access denied');
+        redirect('index.php?page=surveys');
+    }
+    $creators = $auth->getAllUsers();
+    $creators = array_filter($creators, fn($u) => $u['role'] === 'creator');
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $newOwnerId = (int)($_POST['new_owner'] ?? 0);
+        // Verify the new owner is a creator
+        $valid = false;
+        foreach ($creators as $c) {
+            if ($c['id'] === $newOwnerId) { $valid = true; break; }
+        }
+        if ($valid) {
+            $questionnaire->transferOwnership($surveyId, $newOwnerId);
+            setMessage('success', 'Survey ownership transferred');
+            redirect('index.php?page=surveys');
+        } else {
+            setMessage('error', 'Invalid creator selected');
+        }
+    }
+
+    $pageTitle = 'Transfer Survey';
+    include TEMPLATES_DIR . '/header.php';
+    ?>
+    <div class="page-header">
+        <h1 class="page-title">Transfer: <?php echo sanitize($survey['title']); ?></h1>
+    </div>
+    <div class="card" style="max-width:500px;">
+        <form method="POST">
+            <div class="form-group">
+                <label class="form-label">Select New Owner (Creator) *</label>
+                <select name="new_owner" class="form-select" required>
+                    <option value="">-- Select Creator --</option>
+                    <?php foreach ($creators as $c): ?>
+                    <option value="<?php echo $c['id']; ?>"><?php echo sanitize($c['first_name'] . ' ' . $c['last_name']); ?> (@<?php echo sanitize($c['username']); ?>)</option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <button type="submit" class="btn btn-primary">Transfer Survey</button>
+            <a href="index.php?page=surveys" class="btn btn-ghost">Cancel</a>
+        </form>
+    </div>
+    <?php
+    include TEMPLATES_DIR . '/footer.php';
+    exit;
+}
+
+if ($page === 'edit') {
+    $surveyId = (int)($_GET['id'] ?? 0);
+    $survey = $questionnaire->get($surveyId);
+    if (!$survey || $survey['user_id'] != $currentUser['id']) {
+        setMessage('error', 'Survey not found or access denied');
+        redirect('index.php?page=surveys');
+    }
+    $questions = $questionnaire->getQuestions($surveyId);
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        if (isset($_POST['update_survey'])) {
+            $startRaw = trim($_POST['start_date'] ?? '');
+            $endRaw = trim($_POST['end_date'] ?? '');
+            $_POST['start_date'] = $startRaw ? date('Y-m-d H:i:s', strtotime(str_replace('T', ' ', $startRaw))) : null;
+            $_POST['end_date'] = $endRaw ? date('Y-m-d H:i:s', strtotime(str_replace('T', ' ', $endRaw))) : null;
+            $idExtraField = $_POST['id_extra_field'] ?? 'none';
+            $_POST['collect_email'] = $idExtraField === 'email' ? 1 : 0;
+            $_POST['collect_student_number'] = $idExtraField === 'student_number' ? 1 : 0;
+            $questionnaire->update($surveyId, $_POST);
+            setMessage('success', 'Survey updated');
+        } elseif (isset($_POST['add_question'])) {
+            $options = [];
+            if (isset($_POST['options']) && is_array($_POST['options'])) {
+                $options = array_values(array_filter($_POST['options'], function($o) { return !empty(trim($o)); }));
+            }
+            $questionnaire->addQuestion($surveyId, [
+                'type' => $_POST['type'],
+                'question_text' => $_POST['question_text'],
+                'options' => $options,
+                'required' => isset($_POST['required']) ? 1 : 0
+            ]);
+            setMessage('success', 'Question added');
+        } elseif (isset($_POST['delete_question'])) {
+            $questionnaire->deleteQuestion($_POST['question_id']);
+            setMessage('success', 'Question deleted');
+        }
+        redirect('index.php?page=edit&id=' . $surveyId);
+    }
+
+    $pageTitle = 'Edit: ' . $survey['title'];
+    include TEMPLATES_DIR . '/header.php';
+    ?>
+    <div class="page-header">
+        <h1 class="page-title"><?php echo sanitize($survey['title']); ?></h1>
+        <p class="page-subtitle">ID: <?php echo $survey['id']; ?> | Mode: <?php echo IDENTITY_MODES[$survey['identity_mode']] ?? ''; ?></p>
+    </div>
+    <div class="card mb-3">
+        <h2 class="card-title">Survey Settings</h2>
+        <form method="POST">
+            <input type="hidden" name="update_survey" value="1">
+            <div class="form-group">
+                <label class="form-label">Title</label>
+                <input type="text" name="title" class="form-input" value="<?php echo sanitize($survey['title']); ?>">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Description</label>
+                <textarea name="description" class="form-textarea"><?php echo sanitize($survey['description']); ?></textarea>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Category</label>
+                <input type="text" name="category" class="form-input" value="<?php echo sanitize($survey['category'] ?? ''); ?>" placeholder="e.g., Course Evaluation">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Start Date</label>
+                <input type="datetime-local" name="start_date" class="form-input" value="<?php echo $survey['start_date'] ? str_replace(' ', 'T', htmlspecialchars($survey['start_date'])) : ''; ?>">
+            </div>
+            <div class="form-group">
+                <label class="form-label">End Date</label>
+                <input type="datetime-local" name="end_date" class="form-input" value="<?php echo $survey['end_date'] ? str_replace(' ', 'T', htmlspecialchars($survey['end_date'])) : ''; ?>">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Identity Mode *</label>
+                <select name="identity_mode" class="form-select" id="identityModeSelect">
+                    <option value="anonymous" <?php echo ($survey['identity_mode'] ?? '') === 'anonymous' ? 'selected' : ''; ?>>Anonymous - Open to everyone</option>
+                    <option value="identified" <?php echo ($survey['identity_mode'] ?? '') === 'identified' ? 'selected' : ''; ?>>Identified - Name, Surname, Email/Student Number</option>
+                    <option value="access_code" <?php echo ($survey['identity_mode'] ?? '') === 'access_code' ? 'selected' : ''; ?>>Access Code - One-time passwords</option>
+                </select>
+            </div>
+            <div id="identifiedOptionsEdit"<?php echo ($survey['identity_mode'] ?? '') === 'identified' ? '' : ' style="display:none;"'; ?>>
+                <div class="form-group">
+                    <label class="form-label">Collect Optional Field</label>
+                    <?php
+                    $currentExtraField = (!empty($survey['collect_email']) ? 'email' : (!empty($survey['collect_student_number']) ? 'student_number' : 'none'));
+                    ?>
+                    <div class="radio-group">
+                        <label class="form-check"><input type="radio" name="id_extra_field" value="none" class="form-check-input" <?php echo $currentExtraField === 'none' ? 'checked' : ''; ?>> <span>None</span></label>
+                        <label class="form-check"><input type="radio" name="id_extra_field" value="email" class="form-check-input" <?php echo $currentExtraField === 'email' ? 'checked' : ''; ?>> <span>Email address</span></label>
+                        <label class="form-check"><input type="radio" name="id_extra_field" value="student_number" class="form-check-input" <?php echo $currentExtraField === 'student_number' ? 'checked' : ''; ?>> <span>Student number</span></label>
+                    </div>
+                </div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Number of Access Codes</label>
+                <input type="number" name="access_codes_count" class="form-input" value="0" min="0" max="10000">
+                <small class="text-muted">Set to 0 if no codes needed. Only used when Identity Mode is Access Code.</small>
+            </div>
+            <button type="submit" class="btn btn-primary btn-sm">Save Settings</button>
+        </form>
+    </div>
+    <div class="card">
+        <h2 class="card-title">Questions (<?php echo count($questions); ?>)</h2>
+        <?php if (!empty($questions)): ?>
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Question</th>
+                    <th>Type</th>
+                    <th>Required</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($questions as $i => $q): ?>
+                <tr>
+                    <td><?php echo $i + 1; ?></td>
+                    <td><?php echo sanitize(substr($q['question_text'], 0, 60)) . (strlen($q['question_text']) > 60 ? '...' : ''); ?></td>
+                    <td><span class="badge badge-primary"><?php echo ucfirst($q['type']); ?></span></td>
+                    <td><?php echo $q['required'] ? '<span class="badge badge-warning">Yes</span>' : 'No'; ?></td>
+                    <td>
+                        <form method="POST" style="display:inline;">
+                            <input type="hidden" name="question_id" value="<?php echo $q['id']; ?>">
+                            <button type="submit" name="delete_question" class="btn btn-sm btn-ghost" onclick="return confirmAction('Delete this question?')">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+        <?php else: ?>
+        <p class="text-muted">No questions yet.</p>
+        <?php endif; ?>
+
+        <h3 class="mt-3">Add Question</h3>
+        <form method="POST" class="card" style="padding:1rem;">
+            <input type="hidden" name="add_question" value="1">
+            <div class="form-group">
+                <select name="type" class="form-select">
+                    <option value="multiple_choice">Multiple Choice (A,B,C,D,E)</option>
+                    <option value="likert_5">Likert Scale (1-5)</option>
+                    <option value="short_text">Short Text</option>
+                    <option value="long_text">Long Text</option>
+                    <option value="yes_no">Yes / No</option>
+                    <option value="true_false">True / False</option>
+                    <option value="number">Number</option>
+                    <option value="date">Date</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <input type="text" name="question_text" class="form-input" placeholder="Enter your question..." required>
+            </div>
+            <div class="form-check">
+                <input type="checkbox" name="required" value="1" class="form-check-input">
+                <span>Required question</span>
+            </div>
+            <div style="margin-top:10px">
+                <strong>Options</strong> (for Multiple Choice - leave blank for default A,B,C,D,E):
+                <div id="options-container">
+                    <div class="form-group" style="display:flex;gap:.5rem;">
+                        <input type="text" name="options[]" class="form-input" placeholder="Option A">
+                        <input type="text" name="options[]" class="form-input" placeholder="Option B">
+                        <input type="text" name="options[]" class="form-input" placeholder="Option C">
+                        <input type="text" name="options[]" class="form-input" placeholder="Option D">
+                        <input type="text" name="options[]" class="form-input" placeholder="Option E">
+                    </div>
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary mt-2">Add Question</button>
+        </form>
+    </div>
+    <?php
+    include TEMPLATES_DIR . '/footer.php';
+    exit;
+}
+
+if ($page === 'results') {
+    $surveyId = (int)($_GET['id'] ?? 0);
+    $survey = $questionnaire->get($surveyId);
+    if (!$survey || $survey['user_id'] != $currentUser['id']) {
+        setMessage('error', 'Access denied');
+        redirect('index.php?page=surveys');
+    }
+    $questions = $questionnaire->getQuestions($surveyId);
+    $responses = $response->getResponsesWithAnswers($surveyId);
+    $analysisData = $analysis->analyzeQuestionnaire($surveyId);
+    $pageTitle = 'Results: ' . $survey['title'];
+    include TEMPLATES_DIR . '/header.php';
+    ?>
+    <div class="page-header flex justify-between items-center">
+        <div>
+            <h1 class="page-title">Results: <?php echo sanitize($survey['title']); ?></h1>
+            <p>Total Responses: <?php echo count($responses); ?></p>
+        </div>
+        <a href="index.php?page=export_csv&id=<?php echo $surveyId; ?>" class="btn btn-primary">Export CSV</a>
+    </div>
+    <div class="card">
+        <h2 class="card-title">Question Analysis</h2>
+        <?php if (empty($analysisData['questions'])): ?>
+        <p class="text-muted">No questions or responses yet.</p>
+        <?php endif; ?>
+        <?php foreach ($analysisData['questions'] as $q): ?>
+        <div class="mb-3" style="padding:1rem;border:1px solid #e5e7eb;border-radius:.5rem;">
+            <h4><?php echo sanitize($q['text']); ?> <span class="badge badge-primary"><?php echo ucfirst($q['type']); ?></span></h4>
+            <?php if (!empty($q['counts'])): ?>
+            <ul style="list-style:none;padding:0;">
+                <?php foreach ($q['counts'] as $opt => $cnt): ?>
+                <li style="padding:.25rem 0;"><?php echo sanitize($opt); ?>: <?php echo $cnt; ?> (<?php echo $q['percentages'][$opt] ?? 0; ?>%)</li>
+                <?php endforeach; ?>
+            </ul>
+            <?php endif; ?>
+            <?php if (isset($q['average'])): ?>
+            <p style="margin:.5rem 0;">Average: <?php echo round($q['average'], 2); ?></p>
+            <?php endif; ?>
+            <?php if (!empty($q['text_responses'])): ?>
+            <details style="margin-top:.5rem;"><summary>View Text Responses (<?php echo count($q['text_responses']); ?>)</summary>
+                <ul style="max-height:200px;overflow-y:auto;">
+                    <?php foreach ($q['text_responses'] as $t): ?>
+                    <li style="padding:.25rem 0;border-bottom:1px solid #eee;"><?php echo sanitize($t); ?></li>
+                    <?php endforeach; ?>
+                </ul>
+            </details>
+            <?php endif; ?>
+            <?php if (!empty($q['date_responses'])): ?>
+            <ul style="list-style:none;padding:0;">
+                <?php foreach ($q['date_responses'] as $d): ?>
+                <li style="padding:.25rem 0;"><?php echo sanitize($d); ?></li>
+                <?php endforeach; ?>
+            </ul>
             <?php endif; ?>
         </div>
         <?php endforeach; ?>
-        
-        <?php endif; ?>
-        <?php
-        break;
-        
-    default:
-        ?>
-        <div class="page-header">
-            <h1 class="page-title">Dashboard</h1>
-            <p class="page-subtitle">Welcome, <?php echo sanitize(getCurrentUser()['username']); ?>!</p>
-        </div>
-        
-        <?php if (isset($_SESSION['message'])): ?>
-        <div class="alert alert-<?php echo $_SESSION['message']['type']; ?>">
-            <?php echo $_SESSION['message']['text']; ?>
-        </div>
-        <?php unset($_SESSION['message']); endif; ?>
-        
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-value"><?php echo $totalSurveys; ?></div>
-                <div class="stat-label">Total Surveys</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value"><?php echo $totalResponses; ?></div>
-                <div class="stat-label">Total Responses</div>
-            </div>
-        </div>
-        
-        <div class="card">
-            <div class="flex justify-between items-center mb-3">
-                <h2 class="card-title">Recent Surveys</h2>
-                <a href="index.php?page=create" class="btn btn-primary btn-sm">Create New</a>
-            </div>
-            
-            <?php if (empty($surveys)): ?>
-            <div class="empty-state">
-                <div class="empty-state-title">No surveys yet</div>
-                <p>Create your first survey</p>
-            </div>
-            <?php else: ?>
-            <table class="table">
-                <thead>
-                    <tr>
-                        <th>Title</th>
-                        <th>Status</th>
-                        <th>Responses</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <?php foreach (array_slice($surveys, 0, 5) as $s): ?>
-                    <?php $stats = $questionnaire->getStats($s['id']); ?>
-                    <tr>
-                        <td><a href="index.php?page=edit&id=<?php echo $s['id']; ?>"><?php echo sanitize($s['title']); ?></a></td>
-                        <td>
-                            <?php if ($s['is_active']): ?>
-                            <span class="badge badge-success">Active</span>
-                            <?php else: ?>
-                            <span class="badge badge-warning">Inactive</span>
-                            <?php endif; ?>
-                        </td>
-                        <td><?php echo $stats['total_responses']; ?></td>
-                        <td>
-                            <div class="flex gap-1">
-                                <a href="index.php?page=view&id=<?php echo $s['id']; ?>" class="btn btn-sm btn-ghost">View</a>
-                                <a href="index.php?page=results&id=<?php echo $s['id']; ?>" class="btn btn-sm btn-ghost">Results</a>
-                            </div>
-                        </td>
-                    </tr>
-                    <?php endforeach; ?>
-                </tbody>
-            </table>
-            <?php endif; ?>
-        </div>
-        <?php
-        break;
+    </div>
+    <?php
+    include TEMPLATES_DIR . '/footer.php';
+    exit;
 }
 
-include TEMPLATES_DIR . '/footer.php';
+if ($page === 'export_csv') {
+    $surveyId = (int)($_GET['id'] ?? 0);
+    $survey = $questionnaire->get($surveyId);
+    if (!$survey || $survey['user_id'] != $currentUser['id']) {
+        die('Access denied');
+    }
+    $questions = $questionnaire->getQuestions($surveyId);
+    $responses = $response->getResponsesWithAnswers($surveyId);
+
+    header('Content-Type: text/csv');
+    header('Content-Disposition: attachment; filename="results_' . $surveyId . '.csv"');
+    header('Pragma: no-cache');
+
+    $out = fopen('php://output', 'w');
+    $headers = ['Response ID', 'Submitted', 'Name', 'Student Number', 'Email'];
+    foreach ($questions as $q) {
+        $headers[] = sanitize($q['question_text']);
+    }
+    fputcsv($out, $headers);
+
+    foreach ($responses as $r) {
+        $row = [
+            $r['id'],
+            $r['submitted_at'],
+            $r['respondent_name'] ?? '',
+            $r['student_number'] ?? '',
+            $r['email'] ?? ''
+        ];
+        foreach ($questions as $q) {
+            $val = $r['answers'][$q['id']] ?? '';
+            if (is_array($val)) $val = implode(', ', $val);
+            $row[] = $val;
+        }
+        fputcsv($out, $row);
+    }
+    fclose($out);
+    exit;
+}
+
+if ($page === 'download_codes') {
+    $surveyId = (int)($_GET['id'] ?? 0);
+    $survey = $questionnaire->get($surveyId);
+    if (!$survey || $survey['user_id'] != $currentUser['id']) {
+        setMessage('error', 'Access denied');
+        redirect('index.php?page=surveys');
+    }
+    $codes = $db->getAccessCodes($surveyId);
+    header('Content-Type: text/plain');
+    header('Content-Disposition: attachment; filename="access_codes_' . $surveyId . '.txt"');
+    echo "Access Codes for: " . $survey['title'] . "\n";
+    echo "Generated: " . date('Y-m-d H:i:s') . "\n";
+    echo "======================================================\n\n";
+    foreach ($codes as $code) {
+        $status = $code['is_used'] ? " (USED)" : "";
+        echo $code['code'] . $status . "\n";
+    }
+    exit;
+}
+
+if ($page === 'admin') {
+    if ($currentUser['role'] !== 'admin') {
+        setMessage('error', 'Access denied');
+        redirect('index.php');
+    }
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_creator'])) {
+        $result = $auth->register(
+            $_POST['username'] ?? '',
+            $_POST['password'] ?? '',
+            $_POST['email'] ?? null,
+            $_POST['first_name'] ?? null,
+            $_POST['last_name'] ?? null,
+            null,
+            'creator'
+        );
+        if ($result['success']) {
+            setMessage('success', 'Creator created successfully');
+        } else {
+            setMessage('error', $result['error']);
+        }
+        redirect('index.php?page=admin');
+    }
+    $users = $auth->getAllUsers();
+    $pageTitle = 'Admin Panel';
+    include TEMPLATES_DIR . '/header.php';
+    ?>
+    <div class="page-header">
+        <h1 class="page-title">Admin Panel</h1>
+    </div>
+    <div class="card mb-3">
+        <h2 class="card-title">Create New Creator (Lecturer)</h2>
+        <form method="POST">
+            <input type="hidden" name="create_creator" value="1">
+            <div class="form-group">
+                <label class="form-label">Username *</label>
+                <input type="text" name="username" class="form-input" required placeholder="e.g., john_doe">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Password *</label>
+                <input type="password" name="password" class="form-input" required>
+            </div>
+            <div class="form-group">
+                <label class="form-label">First Name</label>
+                <input type="text" name="first_name" class="form-input">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Last Name</label>
+                <input type="text" name="last_name" class="form-input">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Email</label>
+                <input type="email" name="email" class="form-input">
+            </div>
+            <button type="submit" class="btn btn-primary">Create Creator Account</button>
+        </form>
+    </div>
+    <div class="card">
+        <h2 class="card-title">All Users</h2>
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Username</th>
+                    <th>Name</th>
+                    <th>Email</th>
+                    <th>Role</th>
+                    <th>Created</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($users as $u): ?>
+                <tr>
+                    <td><?php echo $u['id']; ?></td>
+                    <td><?php echo sanitize($u['username']); ?></td>
+                    <td><?php echo sanitize(($u['first_name'] ?? '') . ' ' . ($u['last_name'] ?? '')); ?></td>
+                    <td><?php echo sanitize($u['email'] ?? ''); ?></td>
+                    <td><span class="badge badge-<?php echo $u['role'] === 'admin' ? 'warning' : ($u['role'] === 'creator' ? 'primary' : 'success'); ?>"><?php echo ucfirst($u['role']); ?></span></td>
+                    <td><?php echo $u['created_at']; ?></td>
+                    <td>
+                        <?php if ($u['role'] !== 'admin'): ?>
+                        <a href="index.php?page=delete_user&id=<?php echo $u['id']; ?>" class="btn btn-sm btn-ghost" onclick="return confirmAction('Delete this user?')">Delete</a>
+                        <?php endif; ?>
+                    </td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+    <?php
+    include TEMPLATES_DIR . '/footer.php';
+    exit;
+}
+
+if ($page === 'delete_user') {
+    if ($currentUser['role'] !== 'admin') {
+        setMessage('error', 'Access denied');
+        redirect('index.php');
+    }
+    $userId = (int)($_GET['id'] ?? 0);
+    $auth->deleteUser($userId);
+    setMessage('success', 'User deleted');
+    redirect('index.php?page=admin');
+    exit;
+}
+
+if ($page === 'copy') {
+    $surveyId = (int)($_GET['id'] ?? 0);
+    $survey = $questionnaire->get($surveyId);
+    if (!$survey || $survey['user_id'] != $currentUser['id']) {
+        setMessage('error', 'Survey not found or access denied');
+        redirect('index.php?page=surveys');
+    }
+    $newSurveyId = $questionnaire->copy($surveyId, $currentUser['id']);
+    if ($newSurveyId) {
+        setMessage('success', 'Survey copied successfully. Edit the copy as needed.');
+        redirect('index.php?page=edit&id=' . $newSurveyId);
+    } else {
+        setMessage('error', 'Failed to copy survey');
+        redirect('index.php?page=surveys');
+    }
+    exit;
+}
+
+if ($page === 'delete_survey') {
+    $surveyId = (int)($_GET['id'] ?? 0);
+    $survey = $questionnaire->get($surveyId);
+    if (!$survey || $survey['user_id'] != $currentUser['id']) {
+        setMessage('error', 'Survey not found or access denied');
+        redirect('index.php?page=surveys');
+    }
+    $questionnaire->delete($surveyId);
+    setMessage('success', 'Survey deleted');
+    redirect('index.php?page=surveys');
+    exit;
+}
+
+// Default: redirect to public surveys (student landing page)
+if ($page === '') {
+    redirect('index.php?page=public');
+    exit;
+}

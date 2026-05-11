@@ -1,17 +1,19 @@
 <?php
-class ResponseHandler {
+require_once __DIR__ . '/database.php';
+
+class ResponseModel {
     private $db;
     
     public function __construct() {
         $this->db = Database::getInstance();
     }
     
-    public function createResponse($questionnaireId, $respondentName = null, $studentNumber = null, $accessCodeId = null) {
+    public function createResponse($questionnaireId, $respondentName = null, $studentNumber = null, $email = null, $accessCodeId = null) {
         $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
         
         $this->db->executeResponse(
-            "INSERT INTO responses (questionnaire_id, respondent_name, student_number, access_code_id, ip_address) VALUES (?, ?, ?, ?, ?)",
-            array($questionnaireId, $respondentName, $studentNumber, $accessCodeId, $ip)
+            "INSERT INTO responses (questionnaire_id, respondent_name, student_number, email, access_code_id, ip_address) VALUES (?, ?, ?, ?, ?, ?)",
+            [$questionnaireId, $respondentName, $studentNumber, $email, $accessCodeId, $ip]
         );
         
         return $this->db->lastInsertResponseId();
@@ -24,7 +26,7 @@ class ResponseHandler {
         
         $this->db->executeResponse(
             "INSERT INTO answers (response_id, question_id, answer_value) VALUES (?, ?, ?)",
-            array($responseId, $questionId, $value)
+            [$responseId, $questionId, $value]
         );
     }
     
@@ -35,13 +37,13 @@ class ResponseHandler {
     }
     
     public function getResponses($questionnaireId, $limit = 10000) {
-        return $this->db->queryResponse("SELECT * FROM responses WHERE questionnaire_id = ? ORDER BY submitted_at DESC LIMIT ?", array($questionnaireId, $limit));
+        return $this->db->queryResponse("SELECT * FROM responses WHERE questionnaire_id = ? ORDER BY submitted_at DESC LIMIT ?", [$questionnaireId, $limit]);
     }
     
     public function getAnswers($responseId) {
-        $answers = $this->db->queryResponse("SELECT question_id, answer_value FROM answers WHERE response_id = ?", array($responseId));
+        $answers = $this->db->queryResponse("SELECT question_id, answer_value FROM answers WHERE response_id = ?", [$responseId]);
         
-        $result = array();
+        $result = [];
         foreach ($answers as $a) {
             $val = $a['answer_value'];
             $decoded = json_decode($val, true);
@@ -49,5 +51,13 @@ class ResponseHandler {
         }
         
         return $result;
+    }
+    
+    public function getResponsesWithAnswers($questionnaireId) {
+        $responses = $this->getResponses($questionnaireId);
+        foreach ($responses as &$r) {
+            $r['answers'] = $this->getAnswers($r['id']);
+        }
+        return $responses;
     }
 }
